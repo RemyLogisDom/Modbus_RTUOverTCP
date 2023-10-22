@@ -8,6 +8,7 @@
 #include <QThread>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QMutexLocker>
 
 #include "ui_Modbus.h"
 #include "../interface.h"
@@ -155,6 +156,9 @@ public:
     }
 };
 
+enum requestType { reqRead = 0, reqWrite };
+
+
 enum FunctionCode {
     Invalid = 0x00,
     ReadCoils = 0x01,
@@ -289,8 +293,10 @@ QTcpSocket *socket;
 QList<modbusReadRequest*>readReqList;
 QList<modbusWriteRequest*>writeReqList;
 QByteArray responseBuffer;
+QMutex mutexReqList;
 #define Aborts 3
 int aborted = Aborts;
+requestType rType = reqRead;
 
 
 #define SearchLoopBegin												\
@@ -332,13 +338,19 @@ public:
     QObject::connect(socket, &QIODevice::readyRead, [this](){
         responseBuffer += socket->readAll();
         emit(logTCP("get : " + responseBuffer.toHex(' ').toUpper()));
-        if ((responseBuffer.size() > 3) && (!readReqList.isEmpty()))
+        if ((responseBuffer.size() > 3) && (!readReqList.isEmpty() || !writeReqList.isEmpty()))
         {
             //quint8 slave = responseBuffer.at(0);
             //qDebug() << "function = " + responseBuffer.mid(1,1).toHex().toUpper();
+            quint16 address = 0;
             quint8 function = responseBuffer.at(1);
             quint8 dataCount = responseBuffer.at(2);
-            quint16 address = readReqList.first()->address;
+            if (rType == reqRead) {
+                if (!readReqList.isEmpty()) {
+                    address = readReqList.first()->address; } }
+            if (rType == reqWrite) {
+                if (!writeReqList.isEmpty()) {
+                    address = writeReqList.first()->address; } }
             //emit(logTCP(QString("Buffer size %1").arg(responseBuffer.size())));
             switch (function) {
 
@@ -366,7 +378,7 @@ public:
                     if (checkCRC16()) endWriteTransaction();
                     else writeTransactionRetry(); }
                 else {   // wait for more data
-                    if (socket->waitForReadyRead(5000)) emit(logTCP(QString("Not enough Data Buffer size %1").arg(responseBuffer.size())));
+                    if (socket->waitForReadyRead(5000)) emit(logTCPWr(QString("Not enough Data Buffer size %1").arg(responseBuffer.size())));
                     else writeRequestTimeOut();
                 }
                 break;
@@ -375,7 +387,7 @@ public:
                         if (checkCRC16()) endWriteTransaction();
                         else  writeTransactionRetry(); }
                 else {  // wait for more data
-                    if (socket->waitForReadyRead(5000)) emit(logTCP(QString("Not enough Data Buffer size %1").arg(responseBuffer.size())));
+                    if (socket->waitForReadyRead(5000)) emit(logTCPWr(QString("Not enough Data Buffer size %1").arg(responseBuffer.size())));
                     else writeRequestTimeOut();
                 }
                 break;
@@ -383,11 +395,11 @@ public:
             case ReadErrorCode :   //   01 84 01 82 C0
                 emit(logTCP("Read error code " + responseBuffer.mid(2,1).toHex().toUpper()));
                 responseBuffer.clear();
-                if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+                removeFirstReqList();    //if (!readReqList.isEmpty()) delete readReqList.takeFirst();
                 break;
 
             case WriteErrorCode :   //   01 84 01 82 C0
-                emit(logTCP("Write error code " + responseBuffer.mid(2,1).toHex().toUpper()));
+                emit(logTCPWr("Write error code " + responseBuffer.mid(2,1).toHex().toUpper()));
                 responseBuffer.clear();
                 if (!writeReqList.isEmpty()) delete writeReqList.takeFirst();
                 break;
@@ -395,7 +407,7 @@ public:
             default :
                 emit(logTCP(QString("Not yet done for function %1").arg(function)));
                 responseBuffer.clear();
-                if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+                removeFirstReqList();    //if (!readReqList.isEmpty()) delete readReqList.takeFirst();
                 break;
             }
         }
@@ -418,14 +430,16 @@ public:
                 QString reqHex = writeReqList.first()->req.toHex(' ').toUpper();
                 if (socket->isValid())
                 {
-                    emit(logTCP("write request : " + reqHex));
+                    emit(logTCPWr("write request : " + reqHex));
+                    rType = reqWrite;
                     socket->write(writeReqList.first()->req);
                 }
                 if (!Socket.waitForReadyRead(5000)) {
-                    emit(logTCP("resend write request : " + reqHex));
+                    emit(logTCPWr("resend write request : " + reqHex));
+                    rType = reqWrite;
                     socket->write(writeReqList.first()->req);
                     if (!Socket.waitForReadyRead(5000)) {
-                            emit(logTCP("write request aborted : " + reqHex));
+                            emit(logTCPWr("write request aborted : " + reqHex));
                             if (!writeReqList.isEmpty()) delete writeReqList.takeFirst();
                             responseBuffer.clear();
                     }
@@ -440,14 +454,16 @@ public:
                 if (socket->isValid())
                 {
                     emit(logTCP("send : " + reqHex));
+                    rType = reqRead;
                     socket->write(req);
                 }
                 if (!Socket.waitForReadyRead(5000)) {
                     emit(logTCP("resend : " + reqHex));
+                    rType = reqRead;
                     socket->write(req);
                     if (!Socket.waitForReadyRead(5000)) {
                             emit(logTCP("request aborted : " + reqHex));
-                            if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+                            removeFirstReqList();    //if (!readReqList.isEmpty()) delete readReqList.takeFirst();
                             responseBuffer.clear();
                     }
                 }
@@ -456,9 +472,9 @@ public:
                 if (idle == false) {
                     idle = true;
                 }
+            if (endLessLoop) sleep(1);
             }
         }
-        if (endLessLoop) sleep(5);
         responseBuffer.clear();
         readReqList.clear();
         writeReqList.clear();
@@ -472,20 +488,29 @@ public:
     }
 
     void setReadRequest(modbusReadRequest *r) {
+        mutexReqList.lock();
         bool found = false;
         foreach (modbusReadRequest *req, readReqList) {
             if (*r == *req) found = true; }
-        if (!found) readReqList.append(r); }
+        if (!found) readReqList.append(r);
+        mutexReqList.unlock();
+    }
 
     inline void endWriteTransaction() {
         emit(write(responseBuffer));
+        emit(logTCPWr("get : " + responseBuffer.toHex(' ').toUpper()));
         if (!writeReqList.isEmpty()) delete writeReqList.takeFirst();
         responseBuffer.clear();
-        //emit(logTCP("CRC ok"));
         aborted = Aborts; }
 
+    inline void removeFirstReqList() {
+        mutexReqList.lock();
+        if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+        mutexReqList.unlock();
+    }
+
     inline void readRequestTimeOut() {
-        delete readReqList.takeFirst();
+        removeFirstReqList();
         responseBuffer.clear();
         aborted = Aborts; }
 
@@ -500,22 +525,24 @@ public:
         aborted --;
         if (aborted <= 0) {
             emit(logTCP("request aborted"));
-            if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+            removeFirstReqList();
             responseBuffer.clear();
-            aborted = Aborts; } }
+            aborted = Aborts;
+        } }
 
     inline void endReadTransaction() {
         emit(read(responseBuffer));
-        if (!readReqList.isEmpty()) delete readReqList.takeFirst();
+        removeFirstReqList();
         responseBuffer.clear();
-        aborted = Aborts; }
+        aborted = Aborts;
+    }
 
     inline void writeTransactionRetry() {
-        emit(logTCP("CRC bad"));
+        emit(logTCPWr("CRC bad"));
         responseBuffer.clear();
         aborted --;
         if (aborted <= 0) {
-            emit(logTCP("request aborted"));
+            emit(logTCPWr("request aborted"));
             if (!writeReqList.isEmpty()) delete writeReqList.takeFirst();
             responseBuffer.clear();
             aborted = Aborts; } }
@@ -541,7 +568,7 @@ public:
 
 
     void build_read_request(modbusReadRequest *r, QByteArray &req)
-    {
+    { // 01 04 00 37 00 01 80 04
         req.append(r->slave);
         req.append(r->type);
         req.append(r->address >> 8);
@@ -563,6 +590,7 @@ public slots:
             if (*r == *req) found = true;
         }
         if (!found) writeReqList.append(r);
+
     }
 
 signals:
@@ -570,6 +598,7 @@ signals:
     void read(QByteArray);
     void write(QByteArray);
     void logTCP(QString);
+    void logTCPWr(QString);
 };
 
 class ModbusPlugin : public QWidget, LogisDomInterface
@@ -619,6 +648,7 @@ private:
     Ui::ModbusUI *mui;
     QString lastStatus;
     void log(const QString);
+    void logWr(const QString);
     QString logStr;
     tcpSocket socketThread;
     QTcpSocket *socket;
@@ -641,6 +671,7 @@ private slots:
     void read(QByteArray);
     void write(QByteArray);
     void logTCP(QString);
+    void logWrTCP(QString);
     void showLog();
     void on_AddButton_clicked();
     void on_RemoveButton_clicked();

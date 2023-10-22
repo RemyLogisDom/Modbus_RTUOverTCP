@@ -11,6 +11,7 @@
 
 /*
  1.01 Correctif sequence de lecture 16 et 32 et operateur == pour prendre en compte les enchainement 32b
+ 1.02 Correctif sequence de lecture d'adresses consecutives
  */
 
 ModbusPlugin::ModbusPlugin(QWidget *parent) : QWidget(parent)
@@ -75,6 +76,7 @@ ModbusPlugin::ModbusPlugin(QWidget *parent) : QWidget(parent)
     connect(&socketThread, SIGNAL(read(QByteArray)), this, SLOT(read(QByteArray)));
     connect(&socketThread, SIGNAL(write(QByteArray)), this, SLOT(write(QByteArray)));
     connect(&socketThread, SIGNAL(logTCP(QString)), this, SLOT(logTCP(QString)));
+    connect(&socketThread, SIGNAL(logTCPWr(QString)), this, SLOT(logWrTCP(QString)));
 
     tcpIconUnconnectedState.addPixmap(QPixmap(QString::fromUtf8(":/images/images/disconnected.png")), QIcon::Normal, QIcon::Off);
     tcpIconHostLookupState.addPixmap(QPixmap(QString::fromUtf8(":/images/images/connecting.png")), QIcon::Normal, QIcon::Off);
@@ -227,7 +229,7 @@ void ModbusPlugin::setLockedState(bool state)
     mui->editIP->setEnabled(!state);
     mui->editPort->setEnabled(!state);
     mui->editName->setEnabled(!state);
-    mui->checkBoxWr10->setEnabled(!state);
+    //mui->checkBoxWr10->setEnabled(!state);
     mui->spinBoxIdle->setEnabled(!state);
     for (int n=0; n<mui->deviceTable->rowCount(); n++) {
         for (int i=1; i<3; i++) {
@@ -409,9 +411,16 @@ void ModbusPlugin::tcpStatusChange(int state)
     }
 }
 
+
 void ModbusPlugin::logTCP(QString str)
 {
     log(str);
+}
+
+
+void ModbusPlugin::logWrTCP(QString str)
+{
+    logWr(str);
 }
 
 
@@ -483,6 +492,7 @@ void ModbusPlugin::read(QByteArray result)
     quint16 slave = byteArrayToUint16(result.mid(2,1));
     //qDebug() << result.toHex().toUpper() + QString("  %1 %2").arg(A).arg(slave);
     if (result.length() < 5) return;
+    // 00370104020001
     int dataLength = result.at(4);
     for(int n=0; n<dataLength; n+=2) {
         modbusItem *dev = getRomID(slave, A++);
@@ -619,7 +629,7 @@ QString ModbusPlugin::ip2Hex(const QString &ip)
 
 void ModbusPlugin::log(const QString str)
 {
-    if (mui->checkBoxLog->isChecked())
+    if (mui->checkBoxLog->isChecked() && !mui->checkBoxLogWrOnly->isChecked())
     {
         mui->logTxt->append(QDateTime::currentDateTime().toString("HH:mm:ss ") + str);
         QString currenttext = mui->logTxt->toPlainText();
@@ -627,6 +637,18 @@ void ModbusPlugin::log(const QString str)
         mui->logTxt->moveCursor(QTextCursor::End);
     }
 }
+
+void ModbusPlugin::logWr(const QString str)
+{
+    if (mui->checkBoxLogWrOnly->isChecked() || mui->checkBoxLog->isChecked())
+    {
+        mui->logTxt->append(QDateTime::currentDateTime().toString("HH:mm:ss ") + str);
+        QString currenttext = mui->logTxt->toPlainText();
+        if (currenttext.length() > 10000) mui->logTxt->setText(currenttext.mid(9000));
+        mui->logTxt->moveCursor(QTextCursor::End);
+    }
+}
+
 
 void ModbusPlugin::showLog()
 {
@@ -932,7 +954,9 @@ void ModbusPlugin::readDevices(QList<modbusItem*>& devList)
 {
     if (devList.count() == 0) return;
     if (devList.count() == 1) {
-        setReadRequest(devList.first(), 1);
+        registerTypeDef typeDefDevice = static_cast<registerTypeDef>(devList.first()->typeDef->currentIndex());
+        int s = typeToSize(typeDefDevice);
+        setReadRequest(devList.first(), s);
         return; }
     int s = 0;
     int index = 1;
@@ -946,19 +970,21 @@ void ModbusPlugin::readDevices(QList<modbusItem*>& devList)
         }
         // in the other case compute the read request
         else {
-            registerTypeDef typeDefLastDevice = static_cast<registerTypeDef>(devList.at(n)->typeDef->currentIndex());
+            registerTypeDef typeDefLastDevice = static_cast<registerTypeDef>(devList.at(n-1)->typeDef->currentIndex());
             s += typeToSize(typeDefLastDevice);
             setReadRequest(devList.at(n - index), s);
             index = 1;
             s = 0; }
     }
     registerTypeDef typeDefLastDevice = static_cast<registerTypeDef>(devList.last()->typeDef->currentIndex());
+    // Serie is finishing with non consecutive addresses
     if (index == 1)
     {
         registerTypeDef typeDefLastDevice = static_cast<registerTypeDef>(devList.last()->typeDef->currentIndex());
         int s = typeToSize(typeDefLastDevice);
         setReadRequest(devList.last(), s);
     }
+    // Serie is finishing with consecutive addresses
     else
     {
         s += typeToSize(typeDefLastDevice);
